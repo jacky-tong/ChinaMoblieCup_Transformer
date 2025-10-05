@@ -170,59 +170,92 @@
 | `ViT3_base.py` | 模块化设计，完善数据集处理  | 工程化应用，定制化需求   |
 
 
-### 补充说明
-
-#### 1. 模型结构细节
-本项目基于Vision Transformer（ViT）构建目标检测模型，核心结构包括：
-- **Backbone**：采用预训练的`vit_b_16`作为特征提取网络，支持加载本地权重或在线下载ImageNet预训练权重
-- **检测头（DetectionHead）**：由三个子网络组成
-  - 边界框预测头：输出归一化的边界框坐标（x1, y1, x2, y2）
-  - 类别预测头：输出目标类别概率（含背景类）
-  - 置信度预测头：输出预测框的置信度分数
-- **层冻结机制**：支持冻结patch嵌入层及前N层Transformer，仅训练剩余层以减少计算量（通过`_freeze_layers`方法实现）
+以下是对三个核心文件（`ViT5_4k.py`、`vote_config.py`、`pred.py`）的功能说明及使用指南：
 
 
-#### 2. 训练关键优化
-- **学习率调度**：采用warmup+余弦退火策略
-  - Warmup阶段：从1e-7线性升温至基础学习率（`BASE_LR`）
-  - 正式训练：使用余弦退火将学习率从`BASE_LR`衰减至`BASE_LR * 0.01`
-- **损失函数**：多组件加权损失
-  - 边界框损失：采用SmoothL1Loss，对小目标（面积<阈值）增加权重（`SMALL_OBJ_WEIGHT`）
-  - 类别损失：CrossEntropyLoss
-  - 置信度损失：BinaryCrossEntropyLoss（匹配目标为1，未匹配为0）
-- **梯度累积**：支持通过`GRADIENT_ACCUMULATION_STEPS`参数实现梯度累积，模拟大批次训练效果
+### 1. `ViT5_4k.py`：核心模型与训练框架
+#### 功能说明
+该文件是基于Vision Transformer（ViT）的目标检测系统核心实现，包含完整的模型定义、数据处理、损失函数和训练流程，主要功能如下：
+- **数据集处理**：通过`CustomDetectionDataset`类实现数据加载、增强（如随机裁剪、水平翻转、小目标优先增强）和标签归一化，支持多种图像格式（jpg、png等，兼容大小写）。
+- **模型结构**：`ViTDetector`类基于预训练的`vit_b_16`构建，包含：
+  - 特征提取 backbone（支持冻结指定层数的Transformer层）
+  - 检测头（`DetectionHead`）：输出边界框坐标、类别概率和置信度
+- **损失函数**：`DetectionLoss`类实现多组件加权损失（边界框损失用SmoothL1Loss，对小目标增加权重；类别损失用CrossEntropyLoss；置信度损失用BinaryCrossEntropyLoss）。
+- **训练管理**：`Trainer`类封装训练流程，支持学习率预热（warmup）+余弦退火调度、梯度累积、模型保存（最佳模型和检查点）等。
+
+#### 使用指南
+1. **配置参数**：修改文件头部的核心配置（需重点关注）：
+   ```python
+   DATASET_ROOT = "你的数据集路径"  # 需包含images/train、labels/train等子目录
+   LOCAL_VIT_WEIGHTS_PATH = "预训练ViT权重路径"  # 本地权重路径（可选）
+   EPOCHS = 200  # 训练轮数
+   BATCH_SIZE = 8  # 批次大小
+   FREEZE_LAYERS = 4  # 冻结的Transformer层数
+   ```
+2. **启动训练**：直接运行脚本即可启动训练：
+   ```bash
+   python ViT5_4k.py
+   ```
+3. **输出文件**：训练结果保存至`TRAIN_OUTPUT_DIR`（默认`./runs/vit_detector`），包含：
+   - 最佳模型：`weights/best.pt`
+   - 训练日志和检查点
 
 
-#### 3. 数据处理
-- **数据集类（CustomDetectionDataset）**：
-  - 支持多种图像格式（jpg、png等）及大小写文件名兼容
-  - 训练集增强：随机裁剪、水平翻转、色彩抖动，针对小目标增加优先裁剪策略
-  - 验证集处理：固定尺寸缩放+中心裁剪，保证输入一致性
-  - 标签处理：将归一化坐标转换为绝对坐标，支持空标签处理
-- **数据加载优化**：
-  - 采用`persistent_workers=True`复用数据加载进程，减少重复初始化开销
-  - 动态调整`num_workers`数量（不超过CPU核心数的1/4且≤4）
-  - 自定义`collate_fn`处理不同数量目标的样本，避免维度混乱
+### 2. `vote_config.py`：模型推理与预测结果生成
+#### 功能说明
+该文件负责加载训练好的模型并生成预测结果，核心功能包括：
+- **模型加载**：`load_vit_model`函数加载保存的模型权重，自动适配CPU/GPU设备。
+- **单图预测**：`vit_predict_image`函数对单张图片进行推理，输出边界框（含坐标、置信度、类别），并应用非极大值抑制（NMS）过滤冗余框。
+- **批量预测**：`create_vit_predictions`函数批量处理验证集图片，生成预测标签文件（COCO TXT格式，含归一化坐标），并保存至`./ViT_Pred`目录。
+- **标签处理**：`load_labels`函数加载真实标签或预测标签，转换为绝对坐标用于后续评估。
+
+#### 使用指南
+1. **生成预测结果**：调用`create_vit_predictions`函数，示例：
+   ```python
+   # 在文件末尾main函数中配置路径
+   model_path = "./runs/vit_detector/vit_detector/weights/best.pt"  # 训练好的模型路径
+   val_images_path = "数据集/images/val"  # 验证集图片路径
+   val_labels_path = "数据集/labels/val"  # 验证集标签路径
+   pred_dir, _, _ = create_vit_predictions(model_path, val_images_path, val_labels_path, conf=0.5)
+   ```
+2. **参数说明**：
+   - `conf`：置信度阈值（默认0.5，过滤低置信度预测框）
+   - `NMS_IOU_THRESHOLD`：NMS的IoU阈值（默认0.5，控制重复框过滤严格程度）
+3. **输出文件**：预测结果保存至`./ViT_Pred`，包含：
+   - `images/`：复制的验证集图片
+   - `labels/`：预测标签文件（格式：`类别ID 中心x 中心y 宽度 高度 置信度`）
+   - `data.yaml`：数据集配置文件（含类别信息）
 
 
-#### 4. 评估流程
-- **指标计算**：通过`pred.py`实现mAP评估，包括
-  - mAP50：IoU=0.5时的平均精度
-  - mAP50-95：IoU从0.5到0.95（步长0.05）的平均精度
-  - 各类别在IoU=0.5时的AP值
-- **标签加载**：支持区分真实标签（5值格式）和预测标签（6值格式，含置信度），自动转换归一化坐标为绝对坐标
-- **非极大值抑制（NMS）**：在`vote_config.py`中实现，用于过滤冗余预测框（默认IoU阈值0.5）
+### 3. `pred.py`：模型评估（mAP计算）
+#### 功能说明
+该文件用于计算目标检测模型的评估指标，核心功能如下：
+- **指标计算**：`evaluate_map`函数计算不同IoU阈值（0.5~0.95，步长0.05）下的平均精度（AP），包括：
+  - `mAP50`：IoU=0.5时的平均精度
+  - `mAP50-95`：IoU从0.5到0.95的平均精度
+  - 各类别的AP值
+- **辅助函数**：`calculate_iou`计算边界框交并比，`compute_ap`计算单类别AP，`load_labels`加载标签用于评估。
+
+#### 使用指南
+1. **配置评估路径**：修改文件中的路径参数：
+   ```python
+   GT_LABELS_DIR = "数据集/labels/val"  # 真实标签目录
+   PRED_LABELS_DIR = "./ViT_Pred/labels"  # 预测标签目录（vote_config.py生成）
+   IMAGES_DIR = "数据集/images/val"  # 验证集图片目录（用于获取图片尺寸）
+   ```
+2. **运行评估**：直接执行脚本生成评估结果：
+   ```bash
+   python pred.py
+   ```
+3. **输出结果**：控制台将打印：
+   - mAP50和mAP50-95数值
+   - 各IoU阈值下的mAP
+   - 各类别的AP@0.50
 
 
-#### 5. 关键参数配置
-核心配置参数可通过全局变量或配置文件调整，主要包括：
-- 模型参数：`IMG_SIZE`（输入尺寸）、`FREEZE_LAYERS`（冻结层数）、`NUM_CLASSES`（目标类别数）
-- 训练参数：`BATCH_SIZE`、`EPOCHS`、`WARMUP_EPOCHS`、`BASE_LR`、`WEIGHT_DECAY`
-- 数据参数：`SMALL_OBJ_AREA_THR`（小目标面积阈值）、`SMALL_OBJ_WEIGHT`（小目标损失权重）
+### 三者关系与工作流
+1. **训练**：通过`ViT5_4k.py`训练模型，得到权重文件（`best.pt`）。
+2. **推理**：使用`vote_config.py`加载权重，对验证集图片生成预测标签。
+3. **评估**：通过`pred.py`对比真实标签和预测标签，计算mAP指标评估模型性能。
 
-
-#### 6. 注意事项
-- 权重加载：若存在本地ViT权重（`LOCAL_VIT_WEIGHTS_PATH`），将优先加载；否则自动下载ImageNet预训练权重
-- 空标签处理：训练时对无目标样本仅计算背景置信度损失，避免无效梯度
-- 设备兼容：自动使用配置的`DEVICE`（GPU/CPU）进行训练和推理，支持非阻塞数据传输（`non_blocking=True`）加速
-- 模型保存：训练过程中自动保存最佳模型（基于验证损失）和每10轮的检查点，存储路径为`TRAIN_OUTPUT_DIR`
+通过该工作流可完成模型的训练、推理与评估全流程，核心参数可根据实际需求在各文件中调整。
